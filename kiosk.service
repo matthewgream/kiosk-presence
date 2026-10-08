@@ -1,0 +1,31 @@
+[Unit]
+Description=Kiosk display: full-screen browser (cage + cog) on the local console
+Documentation=man:cog(1) man:cage(1) file:/opt/presence/README.md
+After=iotdata-gateway-monitor.service systemd-user-sessions.service
+Wants=iotdata-gateway-monitor.service
+Conflicts=getty@tty1.service
+After=getty@tty1.service
+
+[Service]
+User=kiosk
+PAMName=login
+TTYPath=/dev/tty1
+StandardInput=tty-fail
+StandardOutput=journal
+StandardError=journal
+UtmpIdentifier=tty1
+UtmpMode=user
+Environment=KIOSK_URL=http://localhost/
+# no accessibility bus on a kiosk
+Environment=NO_AT_BRIDGE=1 WEBKIT_A11Y_DISABLE=1
+EnvironmentFile=-/etc/default/kiosk
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do curl -sf -o /dev/null "$KIOSK_URL" && exit 0; sleep 1; done; exit 0'
+# cage is a single-app compositor (one fullscreen client, no window management). It owns the
+# display so the output can be switched off and on in place -- that is how kiosk-presence blanks
+# the screen; cog renders into it as an ordinary Wayland client.
+ExecStart=/usr/bin/cage -- /usr/bin/cog --platform=wl ${KIOSK_URL}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target

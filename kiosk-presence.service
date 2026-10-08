@@ -1,0 +1,21 @@
+[Unit]
+Description=Kiosk presence: blank the screen when the webcam sees no motion
+Documentation=file:/opt/presence/README.md
+After=kiosk.service
+Wants=kiosk.service
+
+[Service]
+User=kiosk
+ExecStart=/usr/local/lib/kiosk-presence/kiosk-presence /etc/default/kiosk-presence
+Restart=always
+RestartSec=5
+# On stop it turns the screen back on before exiting, so a stopped sensor never leaves it dark.
+TimeoutStopSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+# read-only, not yes: "yes" hides /run/user, where cage's Wayland socket is
+ProtectHome=read-only
+PrivateTmp=yes
+
+[Install]
+WantedBy=graphical.target

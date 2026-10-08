@@ -1,0 +1,179 @@
+#!/usr/bin/node
+//
+// kiosk-presence -- blank the kiosk screen when nobody is about, using the webcam as a motion sensor.
+//
+// The camera streams raw YUYV frames from v4l2-ctl; about two a second are reduced to a coarse grid
+// of 4x4-pixel blocks and compared with the previous one. A frame "has motion" when more than
+// `threshold` percent of the blocks changed by more than `block-delta`, after removing any change
+// common to the whole picture -- so auto-exposure and daylight drift do not count, only something
+// moving in part of the view. No motion for `idle` seconds and the screen goes off; the first motion
+// after that brings it back.
+//
+// Off and on are done through the kiosk's own compositor (cage) with wlr-randr: disabling the output
+// stops the video signal, the monitor goes into its own standby, and re-enabling it wakes the
+// monitor with the page still loaded underneath. The monitor's DDC/CI power command is NOT used: the
+// TIO22Gen3 accepts standby that way but ignores the command to come back.
+//
+// Frames are analysed in memory and dropped. Nothing is written to disk or sent anywhere.
+//
+// Config: /etc/default/kiosk-presence (key=value). Runs as the kiosk user, which owns the Wayland
+// socket and is in the video group.
+
+'use strict';
+const fs = require('fs');
+const { spawn, execFile } = require('child_process');
+
+// ------------------------------------------------------------------------------------------ config
+
+const CFG_FILE = process.argv[2] || '/etc/default/kiosk-presence';
+const cfg = {};
+try {
+    for (const line of fs.readFileSync(CFG_FILE, 'utf8').split('\n')) {
+        const m = /^\s*([a-z][a-z0-9-]*)\s*=\s*(.*?)\s*$/.exec(line);
+        if (m) cfg[m[1]] = m[2];
+    }
+} catch (e) {
+    console.error(`kiosk-presence: ${CFG_FILE}: ${e.message} -- running on defaults`);
+}
+const num = (k, d) => (cfg[k] !== undefined && cfg[k] !== '' && !isNaN(Number(cfg[k])) ? Number(cfg[k]) : d);
+
+const DEVICE = cfg['device'] || '/dev/video0';
+const OUTPUT = cfg['output'] || 'DP-1';
+const WIDTH = 320, HEIGHT = 240, FPS = 15;          // the camera's smallest uncompressed mode
+const RATE = num('analyse-per-second', 2);          // frames actually analysed
+const THRESHOLD = num('threshold', 1.5);            // % of blocks that must change
+const BLOCK_DELTA = num('block-delta', 12);         // brightness change (0-255) for a block to count
+const IDLE = num('idle', 300);                      // seconds without motion before the screen goes off
+const SETTLE = num('settle', 5);                    // seconds to ignore the camera after switching
+const RUNTIME = cfg['xdg-runtime-dir'] || `/run/user/${process.getuid()}`;
+const WAYLAND = cfg['wayland-display'] || 'wayland-0';
+
+// ------------------------------------------------------------------------------------------ log
+
+const log = (...a) => console.log(...a);            // journald stamps it
+
+// ------------------------------------------------------------------------------------------ screen
+
+let screenOn = true;                                // cage starts with the output enabled
+let lastMotion = Date.now(), lastSwitch = 0, busy = false, failedAt = 0, lastFailLog = 0;
+
+function wlr(on, cb) {
+    execFile('wlr-randr', ['--output', OUTPUT, on ? '--on' : '--off'],
+        { env: { ...process.env, XDG_RUNTIME_DIR: RUNTIME, WAYLAND_DISPLAY: WAYLAND }, timeout: 10000 },
+        (err, _out, stderr) => cb(err ? (stderr || err.message).trim() : null));
+}
+
+function setScreen(on, why) {
+    // After a failure, wait before trying again -- but never hold back turning the screen ON.
+    if (busy || (!on && Date.now() - failedAt < 30000)) return;
+    busy = true;
+    wlr(on, (err) => {
+        busy = false;
+        if (err) {
+            failedAt = Date.now();
+            if (Date.now() - lastFailLog > 60000) { lastFailLog = Date.now(); log(`screen ${on ? 'on' : 'off'} FAILED (${why}): ${err}`); }
+            return;
+        }
+        failedAt = 0;
+        // Only a real change moves the light in the room; a re-assert must not open a settle
+        // window, or it would blind the sensor for `settle` seconds in every 30.
+        if (screenOn !== on) { log(`screen ${on ? 'ON' : 'OFF'} -- ${why}`); lastSwitch = Date.now(); }
+        screenOn = on;
+    });
+}
+
+// ------------------------------------------------------------------------------------------ motion
+
+const FRAME = WIDTH * HEIGHT * 2, BS = 4, BW = WIDTH / BS, BH = HEIGHT / BS;
+const EVERY = Math.max(1, Math.round(FPS / RATE));
+let prev = null, nFrame = 0, lastFrameAt = 0;
+let stat = { frames: 0, motion: 0, max: 0 };
+
+function grid(f) {
+    const out = new Float32Array(BW * BH);
+    for (let by = 0; by < BH; by++) for (let bx = 0; bx < BW; bx++) {
+        let s = 0;
+        for (let y = 0; y < BS; y++) for (let x = 0; x < BS; x++) s += f[((by * BS + y) * WIDTH + bx * BS + x) * 2];
+        out[by * BW + bx] = s / (BS * BS);
+    }
+    return out;
+}
+
+function analyse(f) {
+    lastFrameAt = Date.now();
+    const g = grid(f);
+    if (prev) {
+        let shift = 0;
+        for (let i = 0; i < g.length; i++) shift += g[i] - prev[i];
+        shift /= g.length;
+        let changed = 0;
+        for (let i = 0; i < g.length; i++) if (Math.abs(g[i] - prev[i] - shift) > BLOCK_DELTA) changed++;
+        const pct = (100 * changed) / g.length;
+        stat.frames++;
+        if (pct > stat.max) stat.max = pct;
+        // The screen's own light changes as it switches; ignore the camera until that has settled,
+        // or blanking would read as motion and wake the screen straight back up.
+        if (pct > THRESHOLD && Date.now() - lastSwitch > SETTLE * 1000) {
+            stat.motion++;
+            lastMotion = Date.now();
+            if (!screenOn) setScreen(true, `motion ${pct.toFixed(1)}%`);
+        }
+    }
+    prev = g;
+}
+
+// ------------------------------------------------------------------------------------------ camera
+
+let cam = null;
+function startCamera() {
+    let buf = Buffer.alloc(0);
+    cam = spawn('v4l2-ctl', ['-d', DEVICE,
+        `--set-fmt-video=width=${WIDTH},height=${HEIGHT},pixelformat=YUYV`, `--set-parm=${FPS}`,
+        '--stream-mmap', '--stream-to=-'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    cam.stdout.on('data', (d) => {
+        buf = buf.length ? Buffer.concat([buf, d]) : d;
+        while (buf.length >= FRAME) {
+            if (nFrame++ % EVERY === 0) analyse(buf.subarray(0, FRAME));
+            buf = buf.subarray(FRAME);
+        }
+    });
+    cam.on('exit', (code, sig) => {
+        log(`camera stream ended (${sig || code}) -- restarting in 5s`);
+        prev = null;
+        setTimeout(startCamera, 5000);
+    });
+    log(`camera ${DEVICE} ${WIDTH}x${HEIGHT} YUYV, analysing ${RATE}/s`);
+}
+
+// ------------------------------------------------------------------------------------------ main loop
+
+setInterval(() => {
+    const now = Date.now();
+    // Fail safe: no frames means no idea who is there, so the screen stays on.
+    if (now - lastFrameAt > 15000) {
+        if (!screenOn) setScreen(true, 'camera not delivering frames');
+        lastMotion = now;
+        return;
+    }
+    if (screenOn && now - lastMotion > IDLE * 1000) setScreen(false, `no motion for ${IDLE}s`);
+    // A kiosk restart brings cage back with the output on; re-assert off so the two cannot disagree.
+    else if (!screenOn && now - lastSwitch > 30000) setScreen(false, 're-assert');
+}, 1000);
+
+setInterval(() => {
+    log(`minute: ${stat.frames} frames, ${stat.motion} with motion, max ${stat.max.toFixed(1)}%, `
+        + `screen ${screenOn ? 'on' : 'off'}, last motion ${Math.round((Date.now() - lastMotion) / 1000)}s ago`);
+    stat = { frames: 0, motion: 0, max: 0 };
+}, 60000);
+
+log(`kiosk-presence: threshold ${THRESHOLD}% (block delta ${BLOCK_DELTA}), off after ${IDLE}s idle, `
+    + `settle ${SETTLE}s, output ${OUTPUT} via ${RUNTIME}/${WAYLAND}`);
+startCamera();
+
+// Leave the screen on when stopped: a stopped sensor must never leave the kiosk dark.
+for (const s of ['SIGTERM', 'SIGINT'])
+    process.on(s, () => {
+        if (cam) cam.kill();
+        wlr(true, () => process.exit(0));
+        setTimeout(() => process.exit(0), 3000);
+    });
