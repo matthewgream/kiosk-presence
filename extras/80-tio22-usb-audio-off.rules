@@ -1,0 +1,6 @@
+# Lenovo ThinkCentre TIO22Gen3: the monitor's built-in USB audio (17ef:a010) is unused here, and
+# while the monitor is in standby (kiosk-presence blanks it) it power-cycles that audio device every
+# ~22s, flooding the kernel log with connect/disconnect lines. Disable the hub port it sits on, so it
+# never enumerates. The webcam on the same internal hub (another port) is unaffected.
+# Undo for this boot: echo 0 > /sys/bus/usb/devices/1-8/1-8:1.0/1-8-port1/disable
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="17ef", ATTR{idProduct}=="a010", RUN+="/bin/sh -c 'echo 1 > /sys%p/port/disable'"

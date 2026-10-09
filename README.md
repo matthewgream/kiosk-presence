@@ -43,3 +43,21 @@ Frames are analysed in memory and dropped -- nothing is stored or sent.
   implement output configuration, which `wlr-randr` uses.
 - Tuning: `journalctl -u kiosk-presence` logs every switch and a per-minute motion summary.
   Measured at the desk: someone keeping still gives 2-11 % blips every few seconds.
+
+## Optional: Lenovo TIO22Gen3 USB audio log flood
+
+Not part of `make install` -- it is specific to one monitor.
+
+A Lenovo ThinkCentre TIO22Gen3 power-cycles its built-in USB audio device (`17ef:a010`) every ~22s
+while the monitor is in standby, so once the screen is blanked the kernel log fills with `usb ...:
+USB disconnect` / `New USB device found` lines (about 160 an hour). If you do not use the monitor's
+audio, `extras/80-tio22-usb-audio-off.rules` disables the hub port that device sits on whenever it
+appears, so it never enumerates. The webcam, on another port of the same internal hub, is unaffected.
+
+```sh
+cp extras/80-tio22-usb-audio-off.rules /etc/udev/rules.d/ && udevadm control --reload
+```
+
+It takes effect at the device's next reconnect (within ~22s while in standby) and at every boot.
+Undo: delete the rule, and for the current boot re-enable the port it disabled, e.g.
+`echo 0 > /sys/bus/usb/devices/1-8/1-8:1.0/1-8-port1/disable`.
